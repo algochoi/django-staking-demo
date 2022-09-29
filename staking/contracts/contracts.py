@@ -3,6 +3,8 @@
 import json
 from pyteal import *
 
+pragma(compiler_version="^0.18.1")
+
 @Subroutine(TealType.uint64)
 def is_creator() -> Expr:
     return Txn.sender() == Global.creator_address()
@@ -12,13 +14,13 @@ def is_admin() -> Expr:
     return Assert(Txn.sender() == App.globalGet(Bytes("A")))
 
 @Subroutine(TealType.none)
-def set_admin(addr: Expr):
+def set_admin(addr: Expr) -> Expr:
     return Seq(
         App.globalPut(Bytes("A"), addr),
     )
 
 @Subroutine(TealType.none)
-def optin_asset(asset: Expr):
+def optin_asset(asset: Expr) -> Expr:
     return Seq(
         InnerTxnBuilder.Begin(),
         InnerTxnBuilder.SetFields({
@@ -36,6 +38,10 @@ def send_asset(
     recipient: abi.Account
 ) -> Expr:
     return Seq(
+        
+        # Store amount we actually need to dispense.
+        (dispensed_amount := ScratchVar()).store(amount.get()),
+
         # Check if we're sending the staking asset or the reward asset
         # If we're trying to send more than the account has, use the maximum
         # available value the account has.
@@ -43,31 +49,36 @@ def send_asset(
         If(asset.asset_id() == App.globalGet(Bytes("SA")))
         .Then(Seq(
             (amount_staked := ScratchVar()).store(App.localGet(recipient.address(), Bytes("AS"))),
-            If(amount.get() > amount_staked.load()).Then(amount.set(amount_staked.load())),
+            If(dispensed_amount.load() > amount_staked.load())
+            .Then(dispensed_amount.store(amount_staked.load())),
             App.localPut(
                 recipient.address(),
                 Bytes("AS"),
-                App.localGet(recipient.address(), Bytes("AS")) - amount_staked.load()
+                App.localGet(recipient.address(), Bytes("AS")) - dispensed_amount.load() # I think this should be (AS - amount) here; will need to store amount in separate scratch slot.
             ),
         ))
-        .Else(Seq(
+        .Else(Seq( # What if the asset is not "SA" OR not "RA"?
             (amount_rewarded := ScratchVar()).store(App.localGet(recipient.address(), Bytes("AR"))),
-            If(amount.get() > amount_rewarded.load()).Then(amount.set(amount_rewarded.load())),
+            If(dispensed_amount.load() > amount_rewarded.load())
+            .Then(dispensed_amount.store(amount_rewarded.load())),
             App.localPut(
                 recipient.address(),
                 Bytes("AR"),
-                App.localGet(recipient.address(), Bytes("AR")) - amount_rewarded.load()
+                App.localGet(recipient.address(), Bytes("AR")) - dispensed_amount.load()
             ),
         )),
+        # There should be a check to fail if the sending asset is not the Staked or Reward Asset.
+
+
         # Send the amount requested or maximum amount available to the recipient.
         InnerTxnBuilder.Begin(),
         InnerTxnBuilder.SetFields(
             {
                 TxnField.type_enum: TxnType.AssetTransfer,
                 TxnField.xfer_asset: asset.asset_id(),
-                TxnField.asset_amount: amount.get(),
+                TxnField.asset_amount: dispensed_amount.load(),
                 TxnField.asset_receiver: recipient.address(),
-                TxnField.fee: Int(0),
+                TxnField.fee: Int(0), # Personal note: Who covers the fee here? First appl call has fee*2?
             }
         ),
         InnerTxnBuilder.Submit(),
@@ -83,10 +94,10 @@ def is_not_paused() -> Expr:
 def calculate_rewards(addr: Expr) -> Expr:
     return Seq(
         # Skip if not begun
-        If(Global.latest_timestamp() > App.globalGet(Bytes("BT")), Return()),
+        If(Global.latest_timestamp() < App.globalGet(Bytes("BT")), Return()),
 
         # Skip if updated since ET
-        If(App.localGet(addr, Bytes("LU")) < App.globalGet(Bytes("ET")), Return()),
+        If(App.localGet(addr, Bytes("LU")) > App.globalGet(Bytes("ET")), Return()), 
 
         # Calculate time since last update
         # End
@@ -104,16 +115,20 @@ def calculate_rewards(addr: Expr) -> Expr:
         # Duration
         (duration := ScratchVar()).store(end.load() - start.load()),
 
-        # Calculate time since last updated
+        # Calculate rewards
         (rewards := ScratchVar()).store(
-            App.localGet(addr, Bytes("AS")) * duration.load() / Int(31557600) * App.globalGet(Bytes("FR")) / Int(10000)
+            App.localGet(addr, Bytes("AS")) * duration.load() / Int(31557600) * App.globalGet(Bytes("FR")) / Int(10000) # I think there might be truncation issues, especially with very high denominator values.
         ),
 
         # Remove rewards from global
-        App.globalPut(Bytes("TR"), App.globalGet(Bytes("TR")) - rewards.load()),
+        App.globalPut(Bytes("TR"), App.globalGet(Bytes("TR")) - rewards.load()), # What happens after "TR" runs out and goes to zero? I think the transaction will fail and any method (i.e. deposit, withdraw) that wants to calculate rewards will also fail. Would anybody be able to take out assets if this happens?
 
         # Add rewards to local
         App.localPut(addr, Bytes("AR"), App.localGet(addr, Bytes("AR")) + rewards.load()),
+
+        # Should we update "LU" here? It seems to be updated in the TEAL code
+        # App.localPut(addr, Bytes("LU"), Global.latest_timestamp())
+        # App.GlobalPut(Bytes("LU"), Global.latest_timestamp()) # Is the Global "LU" just for informational purposes?
     )
 
 router = Router(
@@ -123,13 +138,13 @@ router = Router(
     BareCallActions(
         # On create only, just approve
         no_op=OnCompleteAction.never(),
-        # Just be nice, we _must_ provide _something_ for clear state becuase it is its own
+        # Just be nice, we _must_ provide _something_ for clear state because it is its own
         # program and the router needs _something_ to build
         clear_state=OnCompleteAction.call_only(Approve()),
     ),
 )
 
-@router.method(no_op=CallConfig.ALL, opt_in=CallConfig.ALL)
+@router.method(no_op=CallConfig.CALL, opt_in=CallConfig.CALL)
 def deposit(
     axfer: abi.AssetTransferTransaction,
     asset: abi.Asset
@@ -140,12 +155,18 @@ def deposit(
         # Check the contract isn't paused
         is_not_paused(),
 
+        # Check previous transaction is of type axfer
+        Assert(axfer.get().type_enum() == TxnType.AssetTransfer),
+
         # Confirm sender for this appl and the axfer are the same
         # Note: Do we need to care if it came from the same address?
         Assert(axfer.get().sender() == Txn.sender()),
 
         # Check the staking asset is being received by the smart contract
         Assert(axfer.get().asset_receiver() == Global.current_application_address()),
+
+        # Need to check that axfer contains the Staked asset
+        Assert(axfer.get().xfer_asset() == App.globalGet(Bytes("SA"))),
 
         # Calculate rewards
         calculate_rewards(Txn.sender()),
@@ -241,6 +262,12 @@ def init(
     """Initialise the newly deployed contract, funding it with a minimum
     balance and allowing it to opt in to the request assets."""
     return Seq(
+        # Check if admin is initializing the contract
+        is_admin(),
+
+        # Check previous transaction is a payment transaction
+        Assert(pay.get().type_enum() == TxnType.Payment),
+
         # Check receiver of payment is this smart contract
         Assert(pay.get().receiver() == Global.current_application_address()),
 
@@ -275,6 +302,9 @@ def reward(
     """Primarily used to supply the initial rewards for the staking contract,
     but can also be used to add additional rewards before the contract ends."""
     return Seq(
+        # Check if admin is supplying the rewards
+        is_admin(),
+
         # Check previous transaction is of type axfer
         Assert(rewards.get().type_enum() == TxnType.AssetTransfer),
 
@@ -301,12 +331,12 @@ def config(
 ) -> Expr:
     return Seq(
         is_admin(),
-        App.globalPut(Bytes("P"), Not(Not(paused.get()))),
+        App.globalPut(Bytes("P"), paused.get()),
         set_admin(admin.address()),
     )
 
 if __name__ == '__main__':
-    approval, clearstate, abi = router.compile_program(version=6)
+    approval, clearstate, contract = router.compile_program(version=6)
 
     with open("pyteal_staking.teal", "w") as f:
         f.write(approval)
@@ -315,5 +345,5 @@ if __name__ == '__main__':
         f.write(clearstate)
 
     with open("pyteal_abi.json", "w") as f:
-        f.write(json.dumps(abi.dictify()))
+        f.write(json.dumps(contract.dictify()))
 
